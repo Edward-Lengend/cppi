@@ -42,12 +42,17 @@ def neg_sample(item_set, item_size):  # 前闭后闭
     return item
 
 
-def cosine_similarity(a, b):
-    """
-    计算两个向量a和b之间的余弦相似度
-    """
-    cos_sim = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-    return cos_sim
+def cosine_similarity(matrix):
+    # 计算向量的L2范数（长度）
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+
+    # 对矩阵进行归一化，使得每个向量的范数为1
+    normalized_matrix = matrix / norms
+
+    # 计算归一化后矩阵的内积，得到相似度矩阵
+    similarity_matrix = np.matmul(normalized_matrix, normalized_matrix.T)
+
+    return similarity_matrix
 
 
 class EarlyStopping:

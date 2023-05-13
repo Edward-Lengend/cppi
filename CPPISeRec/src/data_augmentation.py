@@ -163,6 +163,8 @@ class Insert(object):
             self.item_sim_model_2 = item_similarity_model[1]
             self.ensemble = True
         else:
+            print(type(item_similarity_model))
+            print(item_similarity_model)
             self.item_similarity_model = item_similarity_model
             self.ensemble = False
         self.insert_rate = insert_rate

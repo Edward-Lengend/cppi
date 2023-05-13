@@ -8,12 +8,13 @@ import random
 import copy
 import numpy as np
 import argparse
-
+from hnswlib import Index
 import torch
 import torch.nn as nn
 import gensim
 from modules import Encoder, LayerNorm
 from src.utils import cosine_similarity, get_user_seqs
+from datasketch import MinHash, MinHashLSH
 
 
 class SASRecModel(nn.Module):
@@ -93,7 +94,7 @@ class SASRecModel(nn.Module):
 
 
 class OfflineItemSimilarity:
-    def __init__(self, data_file=None, similarity_path=None, model_name='ItemCF', \
+    def __init__(self, args, data_file=None, similarity_path=None, model_name='ItemCF', \
                  dataset_name='Sports_and_Outdoors'):
         """
         :param data_file: 原始的数据集txt文件
@@ -101,6 +102,7 @@ class OfflineItemSimilarity:
         :param model_name:
         :param dataset_name:
         """
+        self.args = args
         self.dataset_name = dataset_name
         self.similarity_path = similarity_path
         # train_data_list used for item2vec, train_data_dict used for itemCF and itemCF-IUF
@@ -278,38 +280,65 @@ class OfflineItemSimilarity:
                     self.itemSimBest[cur_item][related_item] = score
             print("Item2Vec model saved to: ", save_path)
             self._save_dict(self.itemSimBest, save_path=save_path)
-        elif self.model_name == 'graph_embedding':
-            # 读取图嵌入的物品embedding向量
-            item_emb_file = os.path.join(self.data_path, '_knowledgeGraph_embedding.txt')
-            item_emb_dict = {}
-            with open(item_emb_file, 'r') as f:
-                for line in f.readlines():
-                    cols = line.strip().split()
-                    item_id = cols[0]
-                    item_emb = list(map(float, cols[1].split(',')))
-                    item_emb_dict[item_id] = item_emb
+        elif self.model_name == 'cosine_similarity':
+            item_embed = np.load(os.path.join(self.args.data_dir, self.args.data_name+'_item_embedding.npz'))['item_embed']
+            item_similarity_matrix = cosine_similarity(item_embed)
 
-            # 构建相似度矩阵
-            item_ids = list(item_emb_dict.keys())
-            item_num = len(item_ids)
-            item_sim_mat = np.zeros((item_num, item_num))
-            for i in range(item_num):
-                for j in range(i + 1, item_num):
-                    sim = cosine_similarity([item_emb_dict[item_ids[i]]], [item_emb_dict[item_ids[j]]])[0][0]
-                    item_sim_mat[i][j] = sim
-                    item_sim_mat[j][i] = sim
-
-            # 获取最相似的物品
             self.itemSimBest = {}
-            for i in range(item_num):
-                sim_scores = list(enumerate(item_sim_mat[i]))
-                sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-                sim_scores = sim_scores[1:self.n_similar_items + 1]
-                self.itemSimBest[item_ids[i]] = [item_ids[j] for j, _ in sim_scores]
+            for i in range(item_similarity_matrix.shape[0]):
+                self.itemSimBest[i] = {}
+                for j in range(item_similarity_matrix.shape[1]):
+                    if i == j:
+                        continue
+                    self.itemSimBest[i][j] = item_similarity_matrix[i, j]
 
-            # 保存字典到磁盘
-            dict_file = os.path.join(self.data_path, 'item_sim_best.pkl')
-            self._save_dict(self.itemSimBest, dict_file)
+            self._save_dict(self.itemSimBest, save_path=save_path)
+        elif self.model_name == 'HNSW':
+            item_embed = np.load(os.path.join(self.args.data_dir, self.args.data_name+'_item_embedding.npz'))['item_embed']
+
+            # 创建 HNSW 索引
+            hnsw_index = Index(space='cosine', dim=item_embed.shape[1])
+            hnsw_index.init_index(max_elements=item_embed.shape[0], ef_construction=200, M=16)
+            hnsw_index.add_items(item_embed)
+
+            # 计算物品之间的相似度
+            itemSimBest = {}
+            for i in range(item_embed.shape[0]):
+                neighbors, _ = hnsw_index.knn_query(item_embed[i], k=item_embed.shape[0])
+                itemSimBest[i] = {}
+                for j, score in zip(neighbors, _):
+                    if i == j:
+                        continue
+                    itemSimBest[i][j] = 1 - score
+
+            self._save_dict(itemSimBest, save_path=save_path)
+        elif self.model_name == 'MinHash':
+            item_embed = np.load(os.path.join(self.model_dir, 'ml-1m_item_embedding.npz'))['item_embed']
+
+            # 创建 MinHashLSH 对象
+            num_perm = 128  # 设置哈希函数的数量
+            lsh = MinHashLSH(num_perm=num_perm)
+
+            # 计算物品的 MinHash 签名并添加到 LSH 索引中
+            for i in range(item_embed.shape[0]):
+                item_vector = item_embed[i]
+                minhash = MinHash(num_perm=num_perm)
+                for j in range(item_vector.shape[0]):
+                    minhash.update(str(item_vector[j]).encode('utf-8'))
+                lsh.insert(i, minhash)
+
+            # 构建相似度字典
+            itemSimBest = {}
+            for i in range(item_embed.shape[0]):
+                itemSimBest[i] = {}
+                query_minhash = lsh[i]
+                results = lsh.query(query_minhash)
+                for j in results:
+                    if i == j:
+                        continue
+                    itemSimBest[i][j] = 1
+
+            self._save_dict(itemSimBest, save_path=save_path)
 
     def load_similarity_model(self, similarity_model_path):
         if not similarity_model_path:
@@ -320,7 +349,7 @@ class OfflineItemSimilarity:
                 generate_item_similarity
             """
             self._generate_item_similarity(save_path=self.similarity_path)
-        if self.model_name in ['ItemCF', 'ItemCF_IUF', 'Item2Vec', 'LightGCN']:
+        if self.model_name in ['ItemCF', 'ItemCF_IUF', 'Item2Vec',  'cosine_similarity', 'HNSW']:
             with open(similarity_model_path, 'rb') as read_file:
                 similarity_dict = pickle.load(read_file)
             return similarity_dict
@@ -329,7 +358,7 @@ class OfflineItemSimilarity:
             return similarity_dict
 
     def most_similar(self, item, top_k=1, with_score=False):
-        if self.model_name in ['ItemCF', 'ItemCF_IUF', 'Item2Vec', 'LightGCN']:
+        if self.model_name in ['ItemCF', 'ItemCF_IUF', 'Item2Vec', 'cosine_similarity', 'HNSW']:
             """TODO: handle case that item not in keys"""
             if str(item) in self.similarity_model:
                 top_k_items_with_score = sorted(self.similarity_model[str(item)].items(), key=lambda x: x[1], \
@@ -359,121 +388,3 @@ class OfflineItemSimilarity:
                 return list(map(lambda x: (int(x), 0.0), random_items))
             return list(map(lambda x: int(x), random_items))
 
-
-if __name__ == '__main__':
-    if True:
-        parser = argparse.ArgumentParser()
-        # system args
-        parser.add_argument('--data_dir', default='../data/', type=str)
-        parser.add_argument('--output_dir', default='output/', type=str)
-        parser.add_argument('--data_name', default='ml-1m', type=str)
-        parser.add_argument('--do_eval', action='store_true', default=False)
-        parser.add_argument('--model_idx', default=0, type=int, help="model idenfier 10, 20, 30...")
-        parser.add_argument("--gpu_id", type=str, default="0", help="gpu_id")
-
-        # data augmentation args
-        parser.add_argument('--noise_ratio', default=0.0, type=float,
-                            help="percentage of negative interactions in a sequence - robustness analysis")
-        parser.add_argument('--training_data_ratio', default=1.0, type=float,
-                            help="percentage of training samples used for training - robustness analysis")
-        parser.add_argument('--augment_threshold', default=4, type=int,
-                            help="control augmentations on short and long sequences.\
-                                default:-1, means all augmentations types are allowed for all sequences.\
-                                For sequence length < augment_threshold: Insert, and Substitute methods are allowed \
-                                For sequence length > augment_threshold: Crop, Reorder, Substitute, and Mask \
-                                are allowed.")
-        parser.add_argument('--similarity_model_name', default='ItemCF', type=str,
-                            help="Method to generate item similarity score. choices: \
-                                Random, ItemCF, ItemCF_IUF(Inverse user frequency), Item2Vec, LightGCN")
-        parser.add_argument("--augmentation_warm_up_epoches", type=float, default=160,
-                            help="number of epochs to switch from \
-                                memory-based similarity model to \
-                                hybrid similarity model.")
-        parser.add_argument('--insert-first', action='store_true', default=True,
-                            help='whether to perform insert augmentation first')
-        parser.add_argument('--base_augment_type', default='crop', type=str,
-                            help="default data augmentation types. Chosen from: \
-                                mask, crop, reorder, substitute, insert, random, \
-                                combinatorial_enumerate (for multi-view).")
-        parser.add_argument('--augment_type_for_short', default='SIM', type=str,
-                            help="data augmentation types for short sequences. Chosen from: \
-                                SI, SIM, SIR, SIC, SIMR, SIMC, SIRC, SIMRC.")
-        parser.add_argument("--tao", type=float, default=0.2, help="crop ratio for crop operator")
-        parser.add_argument("--gamma", type=float, default=0.7, help="mask ratio for mask operator")
-        parser.add_argument("--beta", type=float, default=0.2, help="reorder ratio for reorder operator")
-        parser.add_argument("--substitute_rate", type=float, default=0.1,
-                            help="substitute ratio for substitute operator")
-        parser.add_argument("--insert_rate", type=float, default=0.4,
-                            help="insert ratio for insert operator")
-        parser.add_argument("--max_insert_num_per_pos", type=int, default=1,
-                            help="maximum insert items per position for insert operator - not studied")
-
-        # contrastive learning task args
-        parser.add_argument('--temperature', default=1.0, type=float,
-                            help='softmax temperature (default:  1.0) - not studied.')
-        parser.add_argument('--n_views', default=2, type=int, metavar='N',
-                            help='Number of augmented data for each sequence - not studied.')
-
-        # model args
-        parser.add_argument("--model_name", default='CoSeRec', type=str)
-        parser.add_argument("--hidden_size", type=int, default=128, help="hidden size of transformer model")
-        parser.add_argument("--num_hidden_layers", type=int, default=2, help="number of layers")
-        parser.add_argument('--num_attention_heads', default=2, type=int)
-        parser.add_argument('--hidden_act', default="gelu", type=str)  # gelu relu
-        parser.add_argument("--attention_probs_dropout_prob", type=float, default=0.5, help="attention dropout p")
-        parser.add_argument("--hidden_dropout_prob", type=float, default=0.5, help="hidden dropout p")
-        parser.add_argument("--initializer_range", type=float, default=0.02)
-        parser.add_argument('--max_seq_length', default=50, type=int)
-
-        # train args
-        parser.add_argument("--lr", type=float, default=0.001, help="learning rate of adam")
-        parser.add_argument("--batch_size", type=int, default=256, help="number of batch_size")
-        parser.add_argument("--epochs", type=int, default=1, help="number of epochs")
-        parser.add_argument("--no_cuda", action="store_true")
-        parser.add_argument("--log_freq", type=int, default=1, help="per epoch print res")
-        parser.add_argument("--seed", default=1, type=int)
-        parser.add_argument("--cf_weight", type=float, default=0.1, \
-                            help="weight of contrastive learning task")
-        parser.add_argument("--rec_weight", type=float, default=1.0, \
-                            help="weight of contrastive learning task")
-
-        # learning related
-        parser.add_argument("--weight_decay", type=float, default=0.0, help="weight_decay of adam")
-        parser.add_argument("--adam_beta1", type=float, default=0.9, help="adam first beta value")
-        parser.add_argument("--adam_beta2", type=float, default=0.999, help="adam second beta value")
-
-        args = parser.parse_args()
-
-        args = parser.parse_args()
-        args.data_file = args.data_dir + args.data_name + '.txt'
-        user_seq, max_item, valid_rating_matrix, test_rating_matrix = \
-            get_user_seqs(args.data_file)
-        # print(user_seq)
-        args.item_size = max_item + 2
-
-        args.mask_id = max_item + 1
-
-        # save model args
-        args_str = f'{args.model_name}-{args.data_name}-{args.model_idx}'
-        args.log_file = os.path.join(args.output_dir, args_str + '.txt')
-        args.train_matrix = valid_rating_matrix
-        checkpoint = args_str + '.pt'
-        args.checkpoint_path = os.path.join(args.output_dir, checkpoint)
-
-        # -----------   pre-computation for item similarity   ------------ #
-        args.similarity_model_path = os.path.join(args.data_dir, \
-                                                  args.data_name + '_' + args.similarity_model_name + '_similarity.pkl')
-    # 实例化模型并打印模型结构
-    # 实例化模型并打印模型结构
-    model = SASRecModel(args)
-    print(model)
-
-    # 随机初始化embedding
-    # random_embedding = model.item_embeddings.weight.detach().clone()
-    # print('Randomly initialized embedding shape:', random_embedding.shape)
-    # print(random_embedding[:10])
-
-    # 预训练embedding
-    pretrained_embedding = model.item_embeddings.weight.detach().clone()
-    print('Pretrained embedding shape:', pretrained_embedding.shape)
-    print(pretrained_embedding[:10])

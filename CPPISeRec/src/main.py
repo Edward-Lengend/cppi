@@ -40,7 +40,7 @@ def main():
                         For sequence length < augment_threshold: Insert, and Substitute methods are allowed \
                         For sequence length > augment_threshold: Crop, Reorder, Substitute, and Mask \
                         are allowed.")
-    parser.add_argument('--similarity_model_name', default='ItemCF', type=str,
+    parser.add_argument('--similarity_model_name', default='cosine_similarity', type=str,
                         help="Method to generate item similarity score. choices: \
                         Random, ItemCF, ItemCF_IUF(Inverse user frequency), Item2Vec, LightGCN")
     parser.add_argument("--augmentation_warm_up_epoches", type=float, default=160,
@@ -157,7 +157,7 @@ def main():
     # ../data/ml-1m_ItemCF_similarity.pkl
 
     # model_name需要传递对应的相似度查询信息
-    offline_similarity_model = OfflineItemSimilarity(data_file=args.data_file,
+    offline_similarity_model = OfflineItemSimilarity(args, data_file=args.data_file,
                                                      similarity_path=args.similarity_model_path,
                                                      model_name=args.similarity_model_name,
                                                      dataset_name=args.data_name)
